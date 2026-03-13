@@ -1,0 +1,11 @@
+cyberwave
+smallestai
+openai
+sounddevice
+pyaudio
+websockets
+opencv-python
+numpy
+python-dotenv
+pydantic
+pyttsx3

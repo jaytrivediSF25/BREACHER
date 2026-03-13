@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  border-radius: 0 !important;
+}
+
+body {
+  background: #000000;
+  color: #ffffff;
+  font-family: 'Courier New', Courier, monospace;
+  overflow: hidden;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes scan {
+  0% { top: 0%; }
+  100% { top: 100%; }
+}
+
+@keyframes wave0 { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(1.8); } }
+@keyframes wave1 { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(1.6); } }
+@keyframes wave2 { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(2.0); } }
+@keyframes wave3 { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(1.4); } }
+@keyframes wave4 { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(1.7); } }
+
+@keyframes ring {
+  0% { r: 12; opacity: 0.5; }
+  100% { r: 22; opacity: 0; }
+}
+
+.animate-pulse-dot {
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+.animate-scan {
+  animation: scan 3s linear infinite;
+}
+
+.animate-wave-0 { animation: wave0 0.8s ease-in-out infinite; animation-delay: 0s; }
+.animate-wave-1 { animation: wave1 0.8s ease-in-out infinite; animation-delay: 0.1s; }
+.animate-wave-2 { animation: wave2 0.8s ease-in-out infinite; animation-delay: 0.2s; }
+.animate-wave-3 { animation: wave3 0.8s ease-in-out infinite; animation-delay: 0.3s; }
+.animate-wave-4 { animation: wave4 0.8s ease-in-out infinite; animation-delay: 0.4s; }
