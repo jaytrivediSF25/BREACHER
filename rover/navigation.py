@@ -1,8 +1,12 @@
-"""Autonomous room sweep using clockwise wall-following.
+"""Autonomous room sweep with breadcrumb-replay return.
 
 Implements the PRD's F-LOC-01 through F-LOC-05: autonomous navigation,
 obstacle avoidance, doorway detection, multi-room sequential clearance,
 and voice-commanded directional overrides.
+
+Two sweep modes:
+  - start_sweep(): vision-guided wall-following (uses GPT-4o to detect walls)
+  - demo_sweep(): scripted enter-pan-exit for reliable hackathon demo
 """
 
 from __future__ import annotations
@@ -13,10 +17,8 @@ from enum import Enum
 from typing import Callable, Optional
 
 from config import (
-    OBSTACLE_THRESHOLD_CM,
     SWEEP_STEP_CM,
     TURN_STEP_DEG,
-    AlertTier,
 )
 from rover.controller import RoverController
 
@@ -34,7 +36,7 @@ class SweepState(str, Enum):
 
 
 class AutonomousSweep:
-    """Clockwise wall-following room sweep with obstacle avoidance."""
+    """Room sweep with breadcrumb-replay return path."""
 
     def __init__(self, controller: RoverController) -> None:
         self._ctrl = controller
@@ -45,14 +47,17 @@ class AutonomousSweep:
         self._max_iterations: int = 40
         self._cancel_event = asyncio.Event()
         self._pause_event = asyncio.Event()
-        self._pause_event.set()  # not paused initially
+        self._pause_event.set()
         self._doorway_continue_event = asyncio.Event()
 
+        self._move_history: list[dict] = []
+
         # Callbacks set by the orchestrator
-        self.on_frame_needed: Optional[Callable] = None       # request a vision frame
+        self.on_frame_needed: Optional[Callable] = None
         self.on_doorway_detected: Optional[Callable] = None
         self.on_sweep_progress: Optional[Callable] = None
         self.on_sweep_complete: Optional[Callable] = None
+        self.on_check_obstacle: Optional[Callable] = None  # vision-based obstacle check
 
     @property
     def state(self) -> SweepState:
@@ -67,17 +72,23 @@ class AutonomousSweep:
         return dict(self._quadrants)
 
     # ------------------------------------------------------------------
-    # Main sweep loop
+    # Main sweep loop — vision-guided (no ultrasonic dependency)
     # ------------------------------------------------------------------
 
     async def start_sweep(self) -> None:
-        """Execute the full clockwise wall-following sweep."""
+        """Execute room sweep using vision-based obstacle detection.
+
+        If on_check_obstacle is wired, the orchestrator's vision model
+        decides when there's a wall ahead. Otherwise falls back to
+        always-move-forward (equivalent to demo_sweep behaviour).
+        """
         if self._state == SweepState.RUNNING:
             return
         self._state = SweepState.RUNNING
         self._cancel_event.clear()
         self._iterations = 0
         self._sweep_pct = 0
+        self._move_history = []
         self._update_quadrant_progress()
         logger.info("Autonomous sweep started")
 
@@ -87,17 +98,16 @@ class AutonomousSweep:
                     break
                 await self._pause_event.wait()
 
-                dist = await self._ctrl.get_ultrasonic_distance()
+                obstacle_ahead = False
+                if self.on_check_obstacle:
+                    obstacle_ahead = await self.on_check_obstacle()
 
-                if dist < OBSTACLE_THRESHOLD_CM:
-                    if self._is_possible_doorway(dist):
-                        await self._handle_doorway()
-                        if self._cancel_event.is_set():
-                            break
-                    else:
-                        await self._ctrl.turn(TURN_STEP_DEG)
+                if obstacle_ahead:
+                    await self._ctrl.turn(TURN_STEP_DEG)
+                    self._move_history.append({"type": "turn", "value": TURN_STEP_DEG})
                 else:
                     await self._ctrl.move_forward(SWEEP_STEP_CM)
+                    self._move_history.append({"type": "forward", "value": SWEEP_STEP_CM})
 
                 self._iterations += 1
                 self._sweep_pct = min(100, (self._iterations / self._max_iterations) * 100)
@@ -125,6 +135,65 @@ class AutonomousSweep:
             self._state = SweepState.ABORTED
 
     # ------------------------------------------------------------------
+    # Demo sweep — scripted enter-pan-exit for hackathon reliability
+    # ------------------------------------------------------------------
+
+    async def demo_sweep(self) -> None:
+        """Reliable demo sweep: enter room, 360 pan, retrace exit."""
+        if self._state == SweepState.RUNNING:
+            return
+        self._state = SweepState.RUNNING
+        self._cancel_event.clear()
+        self._iterations = 0
+        self._sweep_pct = 0
+        self._move_history = []
+        self._update_quadrant_progress()
+        logger.info("Demo sweep started")
+
+        try:
+            for i in range(5):
+                if self._cancel_event.is_set():
+                    break
+                await self._pause_event.wait()
+
+                await self._ctrl.move_forward(SWEEP_STEP_CM)
+                self._move_history.append({"type": "forward", "value": SWEEP_STEP_CM})
+                if self.on_frame_needed:
+                    await self.on_frame_needed()
+                self._iterations += 1
+                self._sweep_pct = min(100, (self._iterations / 20) * 100)
+                self._update_quadrant_progress()
+
+            for _ in range(4):
+                if self._cancel_event.is_set():
+                    break
+                await self._pause_event.wait()
+
+                await self._ctrl.turn(90)
+                self._move_history.append({"type": "turn", "value": 90})
+                await asyncio.sleep(0.5)
+                if self.on_frame_needed:
+                    await self.on_frame_needed()
+                self._iterations += 1
+                self._sweep_pct = min(100, (self._iterations / 20) * 100)
+                self._update_quadrant_progress()
+
+            if not self._cancel_event.is_set():
+                self._state = SweepState.COMPLETE
+                self._sweep_pct = 100
+                self._quadrants = {k: "done" for k in self._quadrants}
+                if self.on_sweep_complete:
+                    await self.on_sweep_complete()
+                logger.info("Demo sweep complete")
+                await self.return_to_entry()
+            else:
+                self._state = SweepState.ABORTED
+
+        except Exception as e:
+            logger.error("Demo sweep error: %s", e, exc_info=True)
+            self._state = SweepState.ABORTED
+
+    # ------------------------------------------------------------------
     # Controls
     # ------------------------------------------------------------------
 
@@ -142,8 +211,8 @@ class AutonomousSweep:
     async def abort(self) -> None:
         """Immediate stop — highest priority."""
         self._cancel_event.set()
-        self._pause_event.set()  # unblock if paused
-        self._doorway_continue_event.set()  # unblock if waiting
+        self._pause_event.set()
+        self._doorway_continue_event.set()
         await self._ctrl.stop()
         self._state = SweepState.ABORTED
         logger.info("Sweep ABORT")
@@ -152,64 +221,54 @@ class AutonomousSweep:
         self._doorway_continue_event.set()
 
     async def redirect(self, direction: str) -> None:
-        """Voice-commanded directional override (e.g. 'check behind the couch')."""
+        """Voice-commanded directional override."""
         logger.info("Redirect: %s", direction)
         was_running = self._state == SweepState.RUNNING
         if was_running:
             await self.pause()
 
         direction_lower = direction.lower()
+        turn_deg = 0
         if "left" in direction_lower:
-            await self._ctrl.turn(-90)
+            turn_deg = -90
         elif "right" in direction_lower:
-            await self._ctrl.turn(90)
+            turn_deg = 90
         elif "back" in direction_lower or "behind" in direction_lower:
-            await self._ctrl.turn(180)
+            turn_deg = 180
+
+        if turn_deg:
+            await self._ctrl.turn(turn_deg)
+            self._move_history.append({"type": "turn", "value": turn_deg})
 
         await self._ctrl.move_forward(SWEEP_STEP_CM * 2)
+        self._move_history.append({"type": "forward", "value": SWEEP_STEP_CM * 2})
 
         if was_running:
             await self.resume()
 
+    # ------------------------------------------------------------------
+    # Breadcrumb return — replay move history in reverse
+    # ------------------------------------------------------------------
+
     async def return_to_entry(self) -> None:
-        """Navigate back toward the entry point using dead reckoning."""
+        """Retrace the exact path back to entry by reversing move history."""
         self._state = SweepState.RETURNING
-        logger.info("Returning to entry")
-        pos = self._ctrl.position
-        import math
-        angle_to_entry = math.degrees(math.atan2(-pos.x, -pos.y))
-        turn_needed = (angle_to_entry - pos.heading + 360) % 360
-        if turn_needed > 180:
-            turn_needed -= 360
-        await self._ctrl.turn(turn_needed)
-        dist = math.sqrt(pos.x ** 2 + pos.y ** 2)
-        await self._ctrl.move_forward(dist)
+        logger.info("Retracing %d moves to entry", len(self._move_history))
+
+        for move in reversed(self._move_history):
+            if self._cancel_event.is_set():
+                break
+            if move["type"] == "forward":
+                await self._ctrl.move_backward(move["value"])
+            elif move["type"] == "turn":
+                await self._ctrl.turn(-move["value"])
+
         self._state = SweepState.COMPLETE
+        logger.info("Back at entry")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    def _is_possible_doorway(self, distance: float) -> bool:
-        """Heuristic: a very short ultrasonic reading that suddenly opens up
-        could indicate a doorway rather than a wall."""
-        return distance > OBSTACLE_THRESHOLD_CM * 0.3
-
-    async def _handle_doorway(self) -> None:
-        self._state = SweepState.WAITING_DOORWAY
-        logger.info("Possible doorway detected")
-        if self.on_doorway_detected:
-            await self.on_doorway_detected()
-
-        self._doorway_continue_event.clear()
-        try:
-            await asyncio.wait_for(self._doorway_continue_event.wait(), timeout=30.0)
-            await self._ctrl.move_forward(SWEEP_STEP_CM * 2)
-            self._state = SweepState.RUNNING
-        except asyncio.TimeoutError:
-            logger.info("Doorway continue timed out, resuming sweep")
-            await self._ctrl.turn(TURN_STEP_DEG)
-            self._state = SweepState.RUNNING
 
     def _update_quadrant_progress(self) -> None:
         pct = self._sweep_pct

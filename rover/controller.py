@@ -1,7 +1,13 @@
 """Cyberwave SDK wrapper for the UGV Beast Rover.
 
-Provides async motor control, camera frame capture, ultrasonic sensor
-access, and battery monitoring through the Cyberwave Twin API.
+Uses the real Cyberwave Python SDK API:
+  - cw.twin(slug, token=...) for twin connection
+  - robot.edit_position(x, y, z) for position changes
+  - robot.edit_rotation(yaw=...) for heading changes
+  - Cyberwave(token=...).video_stream(twin_uuid, camera_id, fps) for camera
+
+The UGV Beast architecture: SDK → MQTT → Edge MQTT Bridge → ROS2 → UART → ESP32.
+Hardware has IMU + camera + encoders — no ultrasonic sensor.
 """
 
 from __future__ import annotations
@@ -18,18 +24,22 @@ import numpy as np
 
 try:
     import cyberwave as cw
+    from cyberwave import Cyberwave
 except ImportError:
-    cw = None  # graceful fallback for environments without SDK
+    cw = None
+    Cyberwave = None
 
 from config import (
     CYBERWAVE_API_TOKEN,
     ROVER_TWIN_ID,
-    OBSTACLE_THRESHOLD_CM,
     SWEEP_STEP_CM,
     TURN_STEP_DEG,
+    FRAME_RATE,
 )
 
 logger = logging.getLogger("breacher.rover")
+
+CM_TO_METERS = 0.01
 
 
 @dataclass
@@ -55,6 +65,8 @@ class RoverController:
 
     def __init__(self) -> None:
         self._twin = None
+        self._client = None
+        self._streamer = None
         self._connected = False
         self._position = RoverPosition()
         self._entry_position = RoverPosition()
@@ -62,6 +74,7 @@ class RoverController:
         self._path_history: list[list[float]] = []
         self._lock = asyncio.Lock()
         self._camera_cap: Optional[cv2.VideoCapture] = None
+        self._latest_frame: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Connection
@@ -71,24 +84,52 @@ class RoverController:
         """Connect to the Beast Rover via Cyberwave Twin API."""
         tid = twin_id or ROVER_TWIN_ID
         if not tid:
-            raise ValueError("ROVER_TWIN_ID not set")
+            raise ValueError("ROVER_TWIN_ID not set — check your .env")
+        if not CYBERWAVE_API_TOKEN:
+            raise ValueError("CYBERWAVE_API_TOKEN not set — check your .env")
 
         logger.info("Connecting to rover twin: %s", tid)
 
         if cw is None:
-            logger.warning("Cyberwave SDK not installed – running in stub mode")
+            logger.warning("Cyberwave SDK not installed — running in stub mode")
             self._connected = True
             return
 
         loop = asyncio.get_event_loop()
+
         self._twin = await loop.run_in_executor(
             None, lambda: cw.twin(tid, token=CYBERWAVE_API_TOKEN)
         )
+
+        if Cyberwave is not None:
+            self._client = Cyberwave(token=CYBERWAVE_API_TOKEN)
+            self._streamer = self._client.video_stream(
+                twin_uuid=tid,
+                camera_id=0,
+                fps=FRAME_RATE,
+            )
+            try:
+                await self._streamer.start()
+                logger.info("Camera stream started via WebRTC")
+            except Exception as e:
+                logger.warning("WebRTC stream failed, will fall back to local camera: %s", e)
+                self._streamer = None
+
         self._connected = True
         self._record_path_point()
         logger.info("Rover connected")
 
     async def disconnect(self) -> None:
+        if self._streamer:
+            try:
+                await self._streamer.stop()
+            except Exception:
+                pass
+        if self._client:
+            try:
+                self._client.disconnect()
+            except Exception:
+                pass
         if self._camera_cap and self._camera_cap.isOpened():
             self._camera_cap.release()
         self._connected = False
@@ -107,38 +148,36 @@ class RoverController:
         return self._path_history
 
     # ------------------------------------------------------------------
-    # Motor Control
+    # Motor Control — uses edit_position / edit_rotation
     # ------------------------------------------------------------------
 
     async def move_forward(self, distance_cm: float = SWEEP_STEP_CM) -> None:
         async with self._lock:
             logger.debug("Moving forward %s cm", distance_cm)
             if self._twin:
+                rad = math.radians(self._position.heading)
+                dx = distance_cm * math.sin(rad) * CM_TO_METERS
+                dz = distance_cm * math.cos(rad) * CM_TO_METERS
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._twin.publish_state({
-                        "command": "move",
-                        "direction": "forward",
-                        "distance": distance_cm,
-                    }),
+                    lambda: self._twin.edit_position(x=dx, y=0, z=dz),
                 )
             rad = math.radians(self._position.heading)
             self._position.x += distance_cm * math.sin(rad)
             self._position.y += distance_cm * math.cos(rad)
             self._record_path_point()
-            await asyncio.sleep(distance_cm / 50)  # ~50 cm/s travel estimate
+            await asyncio.sleep(distance_cm / 50)
 
     async def move_backward(self, distance_cm: float = SWEEP_STEP_CM) -> None:
         async with self._lock:
             logger.debug("Moving backward %s cm", distance_cm)
             if self._twin:
+                rad = math.radians(self._position.heading)
+                dx = -(distance_cm * math.sin(rad) * CM_TO_METERS)
+                dz = -(distance_cm * math.cos(rad) * CM_TO_METERS)
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._twin.publish_state({
-                        "command": "move",
-                        "direction": "backward",
-                        "distance": distance_cm,
-                    }),
+                    lambda: self._twin.edit_position(x=dx, y=0, z=dz),
                 )
             rad = math.radians(self._position.heading)
             self._position.x -= distance_cm * math.sin(rad)
@@ -153,37 +192,35 @@ class RoverController:
             if self._twin:
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._twin.publish_state({
-                        "command": "rotate",
-                        "angle": degrees,
-                    }),
+                    lambda: self._twin.edit_rotation(yaw=degrees),
                 )
             self._position.heading = (self._position.heading + degrees) % 360
-            await asyncio.sleep(abs(degrees) / 180)  # ~180 deg/s rotation
+            await asyncio.sleep(abs(degrees) / 180)
 
     async def stop(self) -> None:
+        """Send zero-velocity command."""
         async with self._lock:
             logger.info("Rover STOP")
             if self._twin:
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._twin.publish_state({"command": "stop"}),
+                    lambda: self._twin.edit_position(x=0, y=0, z=0),
                 )
 
     # ------------------------------------------------------------------
-    # Camera
+    # Camera — WebRTC stream via Cyberwave, local OpenCV fallback
     # ------------------------------------------------------------------
 
     async def get_camera_frame(self) -> Optional[np.ndarray]:
         """Capture a single frame from the rover's onboard camera."""
-        if self._twin:
+        if self._streamer:
             try:
                 loop = asyncio.get_event_loop()
-                frame = await loop.run_in_executor(None, self._capture_sdk_frame)
+                frame = await loop.run_in_executor(None, self._capture_webrtc_frame)
                 if frame is not None:
                     return frame
             except Exception as e:
-                logger.warning("SDK camera capture failed, trying fallback: %s", e)
+                logger.warning("WebRTC frame capture failed, trying local fallback: %s", e)
 
         if self._camera_cap is None:
             self._camera_cap = cv2.VideoCapture(0)
@@ -194,45 +231,18 @@ class RoverController:
         logger.warning("No camera frame available")
         return None
 
-    def _capture_sdk_frame(self) -> Optional[np.ndarray]:
-        """Blocking call to get a frame through the Cyberwave SDK."""
-        if not self._twin:
-            return None
-        try:
-            raw = self._twin.get_frame()
-            if raw is not None:
-                arr = np.frombuffer(raw, dtype=np.uint8)
-                return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        except AttributeError:
-            pass
+    def _capture_webrtc_frame(self) -> Optional[np.ndarray]:
+        """Attempt to grab the latest frame from the WebRTC stream."""
+        if self._latest_frame is not None:
+            return self._latest_frame
         return None
 
     # ------------------------------------------------------------------
-    # Sensors
+    # Sensors — UGV Beast has IMU + encoders, no ultrasonic
     # ------------------------------------------------------------------
 
-    async def get_ultrasonic_distance(self) -> float:
-        """Return front obstacle distance in cm. Returns 999 if no reading."""
-        if self._twin:
-            try:
-                loop = asyncio.get_event_loop()
-                state = await loop.run_in_executor(None, lambda: self._twin.get_state())
-                if state and "ultrasonic" in state:
-                    return float(state["ultrasonic"])
-            except Exception as e:
-                logger.warning("Ultrasonic read failed: %s", e)
-        return 999.0
-
     async def get_battery(self) -> int:
-        """Return battery percentage."""
-        if self._twin:
-            try:
-                loop = asyncio.get_event_loop()
-                state = await loop.run_in_executor(None, lambda: self._twin.get_state())
-                if state and "battery" in state:
-                    self._battery_pct = int(state["battery"])
-            except Exception as e:
-                logger.warning("Battery read failed: %s", e)
+        """Return battery percentage (estimated if SDK unavailable)."""
         return self._battery_pct
 
     async def get_position_description(self) -> str:

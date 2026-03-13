@@ -26,6 +26,7 @@ from config import (
     MissionProfile,
     AlertTier,
     PROFILE_CONFIG,
+    OPENAI_API_KEY,
 )
 from rover.controller import RoverController
 from rover.navigation import AutonomousSweep, SweepState
@@ -110,7 +111,6 @@ class BreacherSystem:
         self.profile = MISSION_PROFILE
         self.profile_config = PROFILE_CONFIG[self.profile]
 
-        # Subsystems
         self.rover = RoverController()
         self.nav = AutonomousSweep(self.rover)
         self.vision = VisionAnalyzer()
@@ -121,7 +121,6 @@ class BreacherSystem:
         self.briefing = BriefingGenerator(TERMINOLOGY_MODE)
         self.cmd_parser = CommandParser()
 
-        # Wiring
         self.alert_mgr.set_tts(self.tts)
         self.stt.on_command = self._handle_voice_command
         self.stt.on_speech_detected = self._handle_barge_in
@@ -129,6 +128,7 @@ class BreacherSystem:
         self.nav.on_doorway_detected = self._on_doorway
         self.nav.on_sweep_progress = self._on_sweep_progress
         self.nav.on_sweep_complete = self._on_sweep_complete
+        self.nav.on_check_obstacle = self._check_obstacle_via_vision
 
         self._ctx = BreacherContext(
             rover=self.rover,
@@ -143,6 +143,8 @@ class BreacherSystem:
 
         self._vision_task: asyncio.Task | None = None
         self._running = False
+        self._last_analysis = None
+        self._pending_vision_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -181,6 +183,9 @@ class BreacherSystem:
 
     async def shutdown(self) -> None:
         self._running = False
+        for t in self._pending_vision_tasks:
+            t.cancel()
+        self._pending_vision_tasks.clear()
         self.alert_mgr.stop()
         await self.stt.stop_listening()
         await self.nav.abort()
@@ -225,16 +230,23 @@ class BreacherSystem:
                 await self._start_mission()
 
     # ------------------------------------------------------------------
-    # Thread 1: Vision loop (called per frame during sweep)
+    # Vision — non-blocking fire-and-forget analysis
     # ------------------------------------------------------------------
 
     async def _vision_frame(self) -> None:
-        """Capture and analyze a single frame during the sweep."""
+        """Capture frame and kick off analysis in background (non-blocking)."""
         frame = await self.rover.get_camera_frame()
         if frame is None:
             return
 
+        task = asyncio.create_task(self._process_frame(frame))
+        self._pending_vision_tasks.add(task)
+        task.add_done_callback(self._pending_vision_tasks.discard)
+
+    async def _process_frame(self, frame) -> None:
+        """Analyze a frame and handle results (runs as background task)."""
         analysis = await self.vision.analyze_frame(frame)
+        self._last_analysis = analysis
         changes = self.scene.update(analysis)
 
         for change in changes:
@@ -256,10 +268,22 @@ class BreacherSystem:
 
         await self._broadcast()
 
-        await asyncio.sleep(1.0 / FRAME_RATE)
+    async def _check_obstacle_via_vision(self) -> bool:
+        """Use the latest vision analysis to detect walls/obstacles ahead.
+
+        Returns True if the scene description suggests an immediate obstacle.
+        Falls back to False (keep moving) if no analysis is available.
+        """
+        if self._last_analysis is None:
+            return False
+
+        desc = self._last_analysis.raw_description.lower()
+        obstacle_keywords = ["wall ahead", "wall directly", "obstacle", "blocked",
+                             "dead end", "cannot proceed", "no passage"]
+        return any(kw in desc for kw in obstacle_keywords)
 
     # ------------------------------------------------------------------
-    # Thread 3: STT loop
+    # STT loop
     # ------------------------------------------------------------------
 
     async def _stt_loop(self) -> None:
@@ -316,10 +340,40 @@ class BreacherSystem:
 
 
 # ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
+
+def _validate_env() -> None:
+    """Crash loud and early if critical env vars are missing."""
+    from config import CYBERWAVE_API_TOKEN, ROVER_TWIN_ID, SMALLEST_API_KEY
+
+    missing = []
+    if not CYBERWAVE_API_TOKEN:
+        missing.append("CYBERWAVE_API_TOKEN")
+    if not ROVER_TWIN_ID:
+        missing.append("ROVER_TWIN_ID")
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+
+    if missing:
+        logger.error(
+            "FATAL: Missing required environment variables: %s\n"
+            "Copy .env.example to .env and fill in your keys.",
+            ", ".join(missing),
+        )
+        sys.exit(1)
+
+    if not SMALLEST_API_KEY:
+        logger.warning("SMALLEST_API_KEY not set — TTS/STT will use local fallback")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
+    _validate_env()
+
     system = BreacherSystem()
 
     loop = asyncio.new_event_loop()

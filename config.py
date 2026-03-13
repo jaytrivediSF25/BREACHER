@@ -144,9 +144,9 @@ STT_LANGUAGE = "en"
 # Navigation
 # ---------------------------------------------------------------------------
 SWEEP_DIRECTION = "clockwise"
-OBSTACLE_THRESHOLD_CM = 30         # stop if obstacle closer than this
 SWEEP_STEP_CM = 20                 # forward step per iteration
 TURN_STEP_DEG = 90                 # turn increment
+USE_DEMO_SWEEP = True              # use scripted demo_sweep for hackathon reliability
 
 # ---------------------------------------------------------------------------
 # WebSocket Server (UI bridge)
