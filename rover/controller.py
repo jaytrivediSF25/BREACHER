@@ -1,13 +1,23 @@
 """Cyberwave SDK wrapper for the UGV Beast Rover.
 
-Uses the real Cyberwave Python SDK API:
-  - cw.twin(slug, token=...) for twin connection
-  - robot.edit_position(x, y, z) for position changes
-  - robot.edit_rotation(yaw=...) for heading changes
-  - Cyberwave(token=...).video_stream(twin_uuid, camera_id, fps) for camera
+Verified Cyberwave Python SDK API (from pypi.org/project/cyberwave v0.3.20):
+  - Cyberwave(token=..., source_type="tele") — remote teleop mode, sends
+    commands through MQTT bridge to the physical rover
+  - robot = cw.twin(twin_id="UUID") — get the rover's digital twin
+  - robot.edit_position(x, y, z) — set twin position (propagated to device
+    in tele mode via MQTT → ROS2 → ESP32)
+  - robot.edit_rotation(yaw=deg) — set twin rotation
+  - robot.joints.set("name", value, degrees=True) — actuate joints
+  - robot.joints.get_all() — read joint states
+  - robot.alerts.create(...) — push alerts to the dashboard
 
-The UGV Beast architecture: SDK → MQTT → Edge MQTT Bridge → ROS2 → UART → ESP32.
-Hardware has IMU + camera + encoders — no ultrasonic sensor.
+Camera: The SDK streams video FROM edge TO cloud (start_streaming).
+There is no documented way to RECEIVE frames via the SDK from the cloud
+side. We use a local OpenCV camera (webcam / USB) for vision analysis.
+
+UGV Beast architecture:
+  Cloud SDK (tele) → MQTT → Edge MQTT Bridge → ROS2 topics → UGV Driver
+  → Serial UART → ESP32 (motors, encoders, IMU, camera servo)
 """
 
 from __future__ import annotations
@@ -23,10 +33,8 @@ import cv2
 import numpy as np
 
 try:
-    import cyberwave as cw
     from cyberwave import Cyberwave
 except ImportError:
-    cw = None
     Cyberwave = None
 
 from config import (
@@ -61,12 +69,15 @@ class RoverPosition:
 
 
 class RoverController:
-    """High-level async interface to the UGV Beast Rover via Cyberwave SDK."""
+    """High-level async interface to the UGV Beast Rover via Cyberwave SDK.
+
+    Motor commands use source_type="tele" so they propagate through the
+    MQTT bridge to the physical hardware, not just update the 3D model.
+    """
 
     def __init__(self) -> None:
+        self._cw: Optional[object] = None
         self._twin = None
-        self._client = None
-        self._streamer = None
         self._connected = False
         self._position = RoverPosition()
         self._entry_position = RoverPosition()
@@ -74,7 +85,6 @@ class RoverController:
         self._path_history: list[list[float]] = []
         self._lock = asyncio.Lock()
         self._camera_cap: Optional[cv2.VideoCapture] = None
-        self._latest_frame: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Connection
@@ -90,44 +100,28 @@ class RoverController:
 
         logger.info("Connecting to rover twin: %s", tid)
 
-        if cw is None:
+        if Cyberwave is None:
             logger.warning("Cyberwave SDK not installed — running in stub mode")
             self._connected = True
             return
 
         loop = asyncio.get_event_loop()
 
-        self._twin = await loop.run_in_executor(
-            None, lambda: cw.twin(tid, token=CYBERWAVE_API_TOKEN)
-        )
+        def _connect():
+            client = Cyberwave(token=CYBERWAVE_API_TOKEN, source_type="tele")
+            twin = client.twin(twin_id=tid)
+            return client, twin
 
-        if Cyberwave is not None:
-            self._client = Cyberwave(token=CYBERWAVE_API_TOKEN)
-            self._streamer = self._client.video_stream(
-                twin_uuid=tid,
-                camera_id=0,
-                fps=FRAME_RATE,
-            )
-            try:
-                await self._streamer.start()
-                logger.info("Camera stream started via WebRTC")
-            except Exception as e:
-                logger.warning("WebRTC stream failed, will fall back to local camera: %s", e)
-                self._streamer = None
+        self._cw, self._twin = await loop.run_in_executor(None, _connect)
 
         self._connected = True
         self._record_path_point()
-        logger.info("Rover connected")
+        logger.info("Rover connected (source_type=tele)")
 
     async def disconnect(self) -> None:
-        if self._streamer:
+        if self._cw:
             try:
-                await self._streamer.stop()
-            except Exception:
-                pass
-        if self._client:
-            try:
-                self._client.disconnect()
+                self._cw.disconnect()
             except Exception:
                 pass
         if self._camera_cap and self._camera_cap.isOpened():
@@ -148,7 +142,11 @@ class RoverController:
         return self._path_history
 
     # ------------------------------------------------------------------
-    # Motor Control — uses edit_position / edit_rotation
+    # Motor Control
+    #
+    # edit_position / edit_rotation are the documented SDK methods.
+    # With source_type="tele", these propagate through MQTT → ROS2 →
+    # ESP32 to move the physical rover.
     # ------------------------------------------------------------------
 
     async def move_forward(self, distance_cm: float = SWEEP_STEP_CM) -> None:
@@ -198,30 +196,23 @@ class RoverController:
             await asyncio.sleep(abs(degrees) / 180)
 
     async def stop(self) -> None:
-        """Send zero-velocity command."""
+        """Stop the rover. No SDK call — rover halts when no new
+        movement commands arrive. Sending edit_position(0,0,0) would
+        teleport to origin, which is wrong."""
         async with self._lock:
             logger.info("Rover STOP")
-            if self._twin:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self._twin.edit_position(x=0, y=0, z=0),
-                )
 
     # ------------------------------------------------------------------
-    # Camera — WebRTC stream via Cyberwave, local OpenCV fallback
+    # Camera — local OpenCV only
+    #
+    # The Cyberwave SDK streams video FROM edge TO cloud (outbound).
+    # There is no documented API to receive frames on the cloud/SDK side.
+    # We capture locally from the laptop webcam or a USB camera connected
+    # to the machine running BREACHER.
     # ------------------------------------------------------------------
 
     async def get_camera_frame(self) -> Optional[np.ndarray]:
-        """Capture a single frame from the rover's onboard camera."""
-        if self._streamer:
-            try:
-                loop = asyncio.get_event_loop()
-                frame = await loop.run_in_executor(None, self._capture_webrtc_frame)
-                if frame is not None:
-                    return frame
-            except Exception as e:
-                logger.warning("WebRTC frame capture failed, trying local fallback: %s", e)
-
+        """Capture a single frame from a local camera."""
         if self._camera_cap is None:
             self._camera_cap = cv2.VideoCapture(0)
         if self._camera_cap.isOpened():
@@ -229,12 +220,6 @@ class RoverController:
             if ret:
                 return frame
         logger.warning("No camera frame available")
-        return None
-
-    def _capture_webrtc_frame(self) -> Optional[np.ndarray]:
-        """Attempt to grab the latest frame from the WebRTC stream."""
-        if self._latest_frame is not None:
-            return self._latest_frame
         return None
 
     # ------------------------------------------------------------------

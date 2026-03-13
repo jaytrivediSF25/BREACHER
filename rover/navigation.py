@@ -179,13 +179,13 @@ class AutonomousSweep:
                 self._update_quadrant_progress()
 
             if not self._cancel_event.is_set():
+                await self.return_to_entry()
                 self._state = SweepState.COMPLETE
                 self._sweep_pct = 100
                 self._quadrants = {k: "done" for k in self._quadrants}
                 if self.on_sweep_complete:
                     await self.on_sweep_complete()
                 logger.info("Demo sweep complete")
-                await self.return_to_entry()
             else:
                 self._state = SweepState.ABORTED
 

@@ -27,6 +27,7 @@ from config import (
     AlertTier,
     PROFILE_CONFIG,
     OPENAI_API_KEY,
+    USE_DEMO_SWEEP,
 )
 from rover.controller import RoverController
 from rover.navigation import AutonomousSweep, SweepState
@@ -212,7 +213,10 @@ class BreacherSystem:
     async def _sweep_and_scan(self) -> None:
         """Run the navigation sweep with interleaved vision analysis."""
         self.state = MissionState.SWEEPING
-        await self.nav.start_sweep()
+        if USE_DEMO_SWEEP:
+            await self.nav.demo_sweep()
+        else:
+            await self.nav.start_sweep()
 
         if self.nav.state == SweepState.COMPLETE:
             self.state = MissionState.COMPLETE
@@ -271,16 +275,23 @@ class BreacherSystem:
     async def _check_obstacle_via_vision(self) -> bool:
         """Use the latest vision analysis to detect walls/obstacles ahead.
 
-        Returns True if the scene description suggests an immediate obstacle.
+        Parses the structured FrameAnalysis layout data (not the raw JSON
+        string), checking cover positions and furniture for wall indicators.
         Falls back to False (keep moving) if no analysis is available.
         """
         if self._last_analysis is None:
             return False
 
-        desc = self._last_analysis.raw_description.lower()
-        obstacle_keywords = ["wall ahead", "wall directly", "obstacle", "blocked",
-                             "dead end", "cannot proceed", "no passage"]
-        return any(kw in desc for kw in obstacle_keywords)
+        layout = self._last_analysis.layout
+        all_items = " ".join(layout.furniture + layout.cover_positions).lower()
+        obstacle_cues = ["wall", "blocked", "dead end", "no exit", "barrier"]
+        if any(cue in all_items for cue in obstacle_cues):
+            return True
+
+        if layout.doorways == 0 and layout.dimensions == "Unknown":
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # STT loop
